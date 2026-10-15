@@ -744,9 +744,9 @@ body {
 
 @media (max-width: 860px), (pointer: coarse) {
   :root {
-    --board-ratio: 480 / 1120;
-    --board-width-factor: 0.4285714286;
-    --board-depth-factor: 2.3333333333;
+    --board-ratio: 480 / 960;
+    --board-width-factor: 0.5;
+    --board-depth-factor: 2;
   }
   body {
     padding: calc(8px + var(--safe-t)) calc(8px + var(--safe-r))

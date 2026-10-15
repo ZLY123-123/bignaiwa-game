@@ -37,6 +37,8 @@
   const FREEZE_MS = 130;     // 清场时的定格，让这一下有重量
   const REVIVE_STEP = 2000;  // 每累计多少分，发一枚复活币
   const MERGE_PAD = 0.8;     // 合成判定的接触容差（px）
+  const RELAY_HOPS = 2;      // 每次投放最多额外接力两跳
+  const RELAY_ENERGY_KEEP = 0.64; // 每跳保留64%动能，按升级后的质量换算速度
 
   /* —— Q 弹手感 —— */
   const RESTITUTION      = 0.52;  // 球与球之间的弹性
@@ -215,11 +217,11 @@
     const oldHeight = H;
     const oldWidth = W;
     W = compact ? 480 : 420;
-    H = compact ? 1120 : 840;
+    H = compact ? 960 : 840;
     const depthScale = (H - DROP_Y) / (oldHeight - DROP_Y);
     const widthScale = (W - 2 * WALL) / (oldWidth - 2 * WALL);
     FRUITS.forEach((fruit, tier) => {
-      fruit.r = Math.round(BASE_RADII[tier] * (compact ? 0.8 : 1));
+      fruit.r = BASE_RADII[tier];
     });
     for (const b of state.balls) {
       b.r = FRUITS[b.tier].r;
@@ -318,6 +320,13 @@
       landed: false,
       dead: false,
       contacts: 0,
+      seekAvailable: false,
+      seekAssisted: false,
+      seekRestTime: 0,
+      bounceReady: false,
+      relayLeft: null,
+      relayHops: 0,
+      relayEnergy: 0,
       pvx: 0, pvy: 0,          // 本子步求解前的速度（用于弹性冲量）
       sq: 0, sqA: 0,           // 挤压变形量 / 变形轴角度
       parts: sh.parts,
@@ -333,6 +342,149 @@
   /* ---------------------------------------------------------
    *  物理
    * ------------------------------------------------------- */
+
+  // 表层轮廓采用竖直采样；上方有其他角色覆盖的部分交给原生碰撞处理。
+  function surfaceY(b, x) {
+    let top = Infinity;
+    for (let k = 0; k < b.parts.length; k++) {
+      const dx = x - b.wx[k], r = b.ws[k];
+      if (Math.abs(dx) < r) top = Math.min(top, b.wy[k] - Math.sqrt(r * r - dx * dx));
+    }
+    return top;
+  }
+
+  function topOf(b) {
+    let top = Infinity;
+    for (let i = 0; i < b.parts.length; i++) top = Math.min(top, b.wy[i] - b.ws[i]);
+    return top;
+  }
+
+  function exposedTarget(target, source) {
+    for (const offset of [0, -0.45, 0.45]) {
+      const x = target.x + target.r * offset;
+      const top = surfaceY(target, x);
+      if (!Number.isFinite(top)) continue;
+      const covered = state.balls.some(other => other !== target && other !== source && !other.dead &&
+        surfaceY(other, x) < top - 2);
+      if (!covered) return true;
+    }
+    return false;
+  }
+
+  // 使用真实子圆轮廓预检整段抛物线，路径中首先碰到目标才提供辅助。
+  function arcReaches(source, target, vx, vy, duration) {
+    const dt = 1 / 180;
+    let x = source.x, y = source.y, angle = source.angle;
+    const parts = source.parts;
+    const px = new Float64Array(parts.length), py = new Float64Array(parts.length);
+    for (let t = dt; t <= duration + 0.06; t += dt) {
+      vy += GRAVITY * dt;
+      x += vx * dt;
+      y += vy * dt;
+      angle += vx * dt / source.r * 0.85;
+      const cos = Math.cos(angle), sin = Math.sin(angle);
+      for (let k = 0; k < parts.length; k++) {
+        const ox = parts[k][0] * source.r, oy = parts[k][1] * source.r;
+        const r = parts[k][2] * source.r;
+        px[k] = x + ox * cos - oy * sin;
+        py[k] = y + ox * sin + oy * cos;
+        if (px[k] - r < WALL || px[k] + r > W - WALL ||
+            py[k] - r < 0 || py[k] + r > H - WALL + 0.5) return false;
+      }
+      let hitTarget = false;
+      for (const other of state.balls) {
+        if (other === source || other.dead) continue;
+        const airborne = other.contacts === 0 || Math.abs(other.vy) > REST_SPEED;
+        const fall = airborne ? GRAVITY * t * (t + dt) * 0.5 : 0;
+        const shiftX = other.vx * t, linear = other.vy * t;
+        let low = linear, high = linear;
+        if (airborne) {
+          // 空中障碍保留起点到自由落点的扫掠区域，覆盖落地后的反弹。
+          low = Math.min(0, linear);
+          high = Math.max(0, linear + fall);
+          let bottom = -Infinity;
+          for (let n = 0; n < other.parts.length; n++) bottom = Math.max(bottom, other.wy[n] + other.ws[n]);
+          if (bottom + linear + fall >= H - WALL) {
+            low = Math.min(low, -(other.vx * other.vx + other.vy * other.vy) / (2 * GRAVITY));
+            high = Math.max(0, H - WALL - other.y);
+          }
+          if (other === target) low = high = linear + fall;
+        }
+        const dx = other.x + shiftX - x;
+        const dy = y < other.y + low ? other.y + low - y
+          : Math.max(0, y - other.y - high);
+        if (dx * dx + dy * dy > (source.rb + other.rb) ** 2) continue;
+        let hit = false;
+        for (let m = 0; m < parts.length && !hit; m++) {
+          for (let n = 0; n < other.parts.length; n++) {
+            const sx = other.wx[n] + shiftX - px[m];
+            const sy = py[m] < other.wy[n] + low ? other.wy[n] + low - py[m]
+              : Math.max(0, py[m] - other.wy[n] - high);
+            const sum = parts[m][2] * source.r + other.ws[n];
+            if (sx * sx + sy * sy < sum * sum) { hit = true; break; }
+          }
+        }
+        if (!hit) continue;
+        if (other === target) hitTarget = true;
+        else return false;
+      }
+      if (hitTarget) return true;
+    }
+    return false;
+  }
+
+  function planBounce(source) {
+    const speed2 = source.vx * source.vx + source.vy * source.vy;
+    if (source.vy > -100 || speed2 < 180 * 180) return null;
+    const candidates = state.balls.filter(other => other !== source && !other.dead &&
+      other.tier === source.tier && other.landed && Math.hypot(other.vx, other.vy) < 160 &&
+      exposedTarget(other, source));
+    candidates.sort((a, b) => topOf(a) - topOf(b) ||
+      Math.abs(a.x - source.x) - Math.abs(b.x - source.x));
+    for (const target of candidates) {
+      let best = null, cost = Infinity;
+      for (const offset of [0, -0.4, 0.4]) {
+        const aimX = target.x + offset * target.r;
+        const top = surfaceY(target, aimX);
+        if (!Number.isFinite(top)) continue;
+        const dx = aimX - source.x, dy = top - source.r * 0.65 - source.y;
+        const energy = speed2 + GRAVITY * dy;
+        const disc = energy * energy - GRAVITY * GRAVITY * (dx * dx + dy * dy);
+        if (disc < 0) continue;
+        for (const sign of [-1, 1]) {
+          const t2 = 2 * (energy + sign * Math.sqrt(disc)) / (GRAVITY * GRAVITY);
+          if (t2 <= 0) continue;
+          const t = Math.sqrt(t2);
+          if (t < 0.06 || t > 1.2) continue;
+          const vx = dx / t, vy = dy / t - GRAVITY * t * 0.5;
+          if (vy > -100 || Math.abs(vx) > Math.sqrt(speed2) * 0.95) continue;
+          const turn = (vx - source.vx) ** 2 + (vy - source.vy) ** 2;
+          if (turn < cost && arcReaches(source, target, vx, vy, t)) {
+            best = { vx, vy, target };
+            cost = turn;
+          }
+        }
+      }
+      // 弱接力可从侧面接触同伴；补查少量等速弧线并复用完整路径验证。
+      if (!best) {
+        const speed = Math.sqrt(speed2), direction = target.x >= source.x ? 1 : -1;
+        const duration = Math.min(1.2, (speed + Math.sqrt(speed2 +
+          2 * GRAVITY * Math.max(0, H - WALL - source.y))) / GRAVITY);
+        for (const degrees of [15, 30, 45, 60, 75]) {
+          const angle = degrees * Math.PI / 180;
+          const vx = direction * speed * Math.sin(angle), vy = -speed * Math.cos(angle);
+          if (vy > -100) continue;
+          const turn = (vx - source.vx) ** 2 + (vy - source.vy) ** 2;
+          if (turn < cost && arcReaches(source, target, vx, vy, duration)) {
+            best = { vx, vy, target };
+            cost = turn;
+          }
+        }
+      }
+      if (best) return best;
+    }
+    return null;
+  }
 
   function stepPhysics(dt) {
     const balls = state.balls;
@@ -350,6 +502,7 @@
       b.x += b.vx * dt;
       b.y += b.vy * dt;
       b.contacts = 0;
+      b.bounceReady = false;
       syncParts(b);
     }
 
@@ -518,6 +671,7 @@
           if (j > 0) {
             b.vx += j * ct.nx;
             b.vy += j * ct.ny;
+            if (ct.ny < -0.25 && b.pvy > REST_THRESHOLD) b.bounceReady = true;
             squash(b, ct.nx, ct.ny, -vnPre);
           }
         }
@@ -534,6 +688,8 @@
           if (j > 0) {
             a.vx -= j * a.invMass * nx;  a.vy -= j * a.invMass * ny;
             b.vx += j * b.invMass * nx;  b.vy += j * b.invMass * ny;
+            if (ny > 0.25 && a.pvy > REST_THRESHOLD) a.bounceReady = true;
+            if (ny < -0.25 && b.pvy > REST_THRESHOLD) b.bounceReady = true;
             squash(a, -nx, -ny, vnPre);
             squash(b, nx, ny, vnPre);
           }
@@ -543,6 +699,27 @@
 
     /* --- 处理合成 --- */
     if (merges.length) processMerges(merges);
+    for (const b of state.balls) {
+      if ((!b.seekAvailable && b.relayLeft === null) || b.dead) continue;
+      b.seekRestTime = b.contacts > 0 && Math.hypot(b.vx, b.vy) < REST_THRESHOLD
+        ? b.seekRestTime + dt : 0;
+      if (b.seekRestTime >= 0.12) {
+        b.seekAvailable = false;
+        b.relayLeft = null;
+        b.relayHops = 0;
+        b.relayEnergy = 0;
+        continue;
+      }
+      if (!b.seekAvailable || !b.bounceReady || b.vy >= -REST_THRESHOLD) continue;
+      b.seekAvailable = false;
+      b.relayEnergy = b.mass * (b.vx * b.vx + b.vy * b.vy);
+      const plan = planBounce(b);
+      if (plan) {
+        b.vx = plan.vx;
+        b.vy = plan.vy;
+        b.seekAssisted = true;
+      }
+    }
   }
 
   /* 撞击挤压：沿撞击法线压扁、垂直方向拉伸，做出果冻感 */
@@ -554,6 +731,7 @@
   }
 
   function processMerges(merges) {
+    const relays = [];
     for (let k = 0; k < merges.length; k++) {
       const a = merges[k][0];
       const b = merges[k][1];
@@ -588,7 +766,30 @@
         nb.py = nb.y;
         nb.landed = true;
         nb.popAt = performance.now();
+        syncParts(nb);
         state.balls.push(nb);
+
+        // 接力次数沿整条合成链继承；较少的剩余额度优先，保持原有上限。
+        let driver = null, energy = 0;
+        for (const parent of [a, b]) {
+          if (!Number.isInteger(parent.relayLeft)) continue;
+          const kinetic = parent.mass * (parent.pvx * parent.pvx + parent.pvy * parent.pvy);
+          const available = parent.relayEnergy > 0
+            ? Math.min(parent.relayEnergy, kinetic) : kinetic * RESTITUTION * RESTITUTION;
+          if (!driver || parent.relayLeft < driver.relayLeft ||
+              (parent.relayLeft === driver.relayLeft && available > energy)) {
+            driver = parent;
+            energy = available;
+          }
+        }
+        if (driver) {
+          nb.relayLeft = 0;
+          nb.relayHops = driver.relayHops;
+          if (driver.relayLeft > 0) {
+            nb.relayEnergy = energy * RELAY_ENERGY_KEEP;
+            relays.push({ ball: nb, left: driver.relayLeft - 1 });
+          }
+        }
 
         addScore(MERGE_SCORE[nt], mx, my, '+' + MERGE_SCORE[nt]);
         burst(mx, my, nt, 8 + nt * 2, 140 + nt * 22);
@@ -604,6 +805,24 @@
       if (!state.balls[i].dead) alive.push(state.balls[i]);
     }
     state.balls = alive;
+    for (const relay of relays) {
+      const nb = relay.ball;
+      const vx = nb.vx, vy = nb.vy;
+      nb.vx = 0;
+      nb.vy = -Math.sqrt(nb.relayEnergy / nb.mass);
+      const plan = planBounce(nb);
+      if (plan) {
+        nb.vx = plan.vx;
+        nb.vy = plan.vy;
+        nb.relayLeft = relay.left;
+        nb.relayHops++;
+        nb.seekAssisted = true;
+        state.floats.push({ x: nb.x, y: nb.y - 45, text: '接力 ×' + nb.relayHops, life: 1.4 });
+      } else {
+        nb.vx = vx;
+        nb.vy = vy;
+      }
+    }
   }
 
   /* ---------------------------------------------------------
@@ -704,6 +923,8 @@
     const x = clamp(state.aimX, lo, hi);
 
     const ball = makeBall(x, DROP_Y, tier, 0, 130);
+    ball.seekAvailable = true;
+    ball.relayLeft = RELAY_HOPS;
     state.balls.push(ball);
 
     state.ready = false;
@@ -1426,7 +1647,7 @@
 
   /* 调试句柄（控制台可用）：__DNW__.state / .reset() / .drop() / .FRUITS / .render() */
   window.__DNW__ = { state, reset, revive, settle, gameOver, tryDrop, stepPhysics, update, FRUITS,
-                     render, resizeCanvas, shapeOf, makeBall, paintRevives, addScore,
+                     render, resizeCanvas, shapeOf, makeBall, paintRevives, addScore, planBounce,
                      MAX_BONUS, REVIVE_STEP,
                      blurReady: () => !!blurImg };
 })();
